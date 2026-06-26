@@ -34,24 +34,6 @@ def _validate_license():
     gated accordingly. In free builds (premium modules absent),
     this is a no-op.
     """
-    from swingmusic.premium import LicenseManager, LicenseError
-
-    if LicenseManager is None:
-        # Premium not available in this build; nothing to validate.
-        return
-
-    try:
-        manager = LicenseManager()
-        manager.validate()
-    except LicenseError:
-        # Validation errors (expired, revoked, not registered)
-        # State is already updated - premium features will be disabled
-        pass
-    except Exception:
-        # Network errors or unexpected issues
-        # Grace period will apply based on last_validated timestamp
-        pass
-
 
 def is_uuid4(value: str) -> bool:
     """

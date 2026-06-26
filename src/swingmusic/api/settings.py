@@ -5,13 +5,6 @@ from flask_openapi3 import APIBlueprint
 from dataclasses import asdict
 from pydantic import BaseModel, Field
 
-from swingmusic.premium import (
-    CloudError,
-    CloudClient,
-    LicenseError,
-    CloudAuthError,
-    LicenseManager,
-)
 from swingmusic.config import UserConfig
 from swingmusic.settings import Metadata
 from swingmusic.db.userdata import PluginTable
@@ -23,12 +16,6 @@ from swingmusic.utils.paths import normalize_paths
 from swingmusic.utils.auth import get_current_userid
 from swingmusic.utils.hardware_id import get_device_id, get_device_name
 
-# Error payload returned by premium-gated endpoints when the compiled
-# premium module is not shipped in this build (free-tier / OSS clone).
-_PREMIUM_UNAVAILABLE = (
-    {"error": "Premium features are not available in this build"},
-    501,
-)
 
 bp_tag = Tag(name="Settings", description="Customize stuff")
 api = APIBlueprint("settings", __name__, url_prefix="/notsettings", abp_tags=[bp_tag])
@@ -111,15 +98,6 @@ def get_all_settings():
     config["lastfmSessionKey"] = config["lastfmSessionKeys"].get(str(current_user), "")
     del config["lastfmSessionKeys"]
 
-    # remove license info if user is not admin
-    # if "admin" not in UserTable.get_by_id(current_user).roles:
-    del config["licenseKey"]
-
-    # add device name to config
-    config["deviceName"] = get_device_name()
-    config["deviceId"] = get_device_id()
-    config["licenseInfo"] = LicenseManager().get_license_info()
-
     return config
 
 
@@ -198,140 +176,3 @@ def update_config(body: UpdateConfigBody):
     return {
         "msg": "Config updated!",
     }
-
-
-class RegisterLicenseBody(BaseModel):
-    license_key: str = Field(
-        description="The 40 character license key",
-        example="SMX-XXXX-XXXX-XXXX-XXXX",
-    )
-    device_name: str = Field(
-        description="Human-readable device name",
-        example="MacBook Pro",
-    )
-
-
-@api.post("/license/register")
-@admin_required()
-def register_license(body: RegisterLicenseBody):
-    """
-    Register this device with a license key.
-
-    Activates premium features for this device.
-    Each license supports up to 3 devices.
-    """
-    if LicenseManager is None:
-        return _PREMIUM_UNAVAILABLE
-
-    try:
-        manager = LicenseManager()
-        result = manager.register(body.license_key, body.device_name)
-
-        return {
-            "msg": "License activated successfully",
-            "license": result.get("user"),
-            "customer": result.get("customer"),
-            "devices": result.get("devices"),
-        }
-    except CloudAuthError as e:
-        return {"error": str(e)}, e.status_code or 400
-    except CloudError as e:
-        return {"error": str(e)}, e.status_code or 500
-    except LicenseError as e:
-        return {"error": str(e)}, 400
-
-
-@api.get("/license/status")
-@admin_required()
-def get_license_status():
-    """
-    Get current license status.
-
-    Returns license info if registered, or null if not.
-    """
-    if LicenseManager is None:
-        return _PREMIUM_UNAVAILABLE
-
-    try:
-        manager = LicenseManager()
-        info = manager.get_license_info()
-    except LicenseError as e:
-        return {
-            "error": str(e),
-            "redirect_url": CloudClient.CLIENT_REDIRECT_URL,
-            "client_id": CloudClient.CLIENT_ID,
-        }, 400
-
-    if not info:
-        return {
-            "error": "No license found",
-            "redirect_url": CloudClient.CLIENT_REDIRECT_URL,
-            "client_id": CloudClient.CLIENT_ID,
-        }, 404
-
-    return {
-        **info,
-        "redirect_url": CloudClient.CLIENT_REDIRECT_URL,
-        "client_id": CloudClient.CLIENT_ID,
-    }, 200
-
-
-# @api.delete("/license/deactivate")
-# @admin_required()
-# def deactivate_license():
-#     """
-#     Deactivate the license on this device.
-
-#     Clears local license state. Does not revoke the device from the server.
-#     """
-#     manager = LicenseManager()
-#     manager.deactivate()
-
-#     return {"msg": "License deactivated"}
-
-
-class DeviceIdPath(BaseModel):
-    device_id: str = Field(
-        description="The device ID to revoke",
-        example="a1b2c3d4e5f67890",
-    )
-
-
-@api.delete("/license/device/<device_id>")
-@admin_required()
-def revoke_device(path: DeviceIdPath):
-    """
-    Revoke a device from the license.
-
-    Can revoke any device on your license, including yourself.
-    """
-    if LicenseManager is None or CloudClient is None:
-        return _PREMIUM_UNAVAILABLE
-
-    device_id = path.device_id
-
-    try:
-        client = CloudClient()
-        result = client.revoke_device(device_id)
-
-        # if the device is the current device, deactivate the license
-        if device_id == get_device_id():
-            manager = LicenseManager()
-            manager.deactivate()
-
-        # Re-validate to update local state
-        manager = LicenseManager()
-        try:
-            manager.validate()
-        except LicenseError:
-            pass  # State already updated
-
-        return {
-            "msg": "Device revoked",
-            "revoked": result.get("revoked"),
-            "devices": result.get("devices"),
-        }
-    except CloudAuthError as e:
-        return {"error": str(e)}, e.status_code or 400
-    except CloudError as e:
-        return {"error": str(e)}, e.status_code or 500

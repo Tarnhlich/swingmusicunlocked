@@ -37,11 +37,6 @@ ENV PATH="/usr/lib/ccache:${PATH}"
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install nuitka
 
-# Only the premium sources affect this stage. Any change to non-premium
-# code leaves this layer cached, skipping Nuitka entirely on rebuilds.
-COPY scripts/compile-premium-modules.sh ./scripts/
-COPY src/swingmusic/premium/ ./src/swingmusic/premium/
-
 RUN --mount=type=cache,target=/root/.cache/ccache,sharing=locked \
     --mount=type=cache,target=/root/.cache/Nuitka,sharing=locked \
     CCACHE_DIR=/root/.cache/ccache bash scripts/compile-premium-modules.sh
@@ -67,13 +62,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install setuptools setuptools-scm
 
 COPY pyproject.toml requirements.txt version.txt README.md ./
-COPY scripts/ ./scripts/
 COPY src/ ./src/
-
-# Replace premium .py sources with the .so artifacts from the compiler
-# stage. Premium source never enters the wheel — only compiled object code.
-RUN find src/swingmusic/premium -name "*.py" ! -name "__init__.py" -delete
-COPY --from=compiler /build/src/swingmusic/premium/ ./src/swingmusic/premium/
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip wheel . --no-deps --no-build-isolation -w /wheels

@@ -18,7 +18,7 @@ from flask_openapi3 import Info, OpenAPI
 
 from swingmusic import api as swing_api
 from swingmusic.api.plugins import lyrics as lyrics_plugin
-from swingmusic.premium import mixes_api
+from swingmusic.api.plugins import mixes as mixes_plugin
 from swingmusic.config import UserConfig
 from swingmusic.db.userdata import UserTable
 from swingmusic.settings import Metadata, Paths
@@ -106,11 +106,7 @@ def load_plugins(web: OpenAPI):
     # Plugins
     web.register_api(swing_api.plugins.api)
     web.register_api(lyrics_plugin.api)
-
-    # The mixes plugin is only registered when the compiled premium
-    # module is present in this build.
-    if mixes_api is not None:
-        web.register_api(mixes_api)
+    web.register_api(mixes_plugin.api)
 
 
 # # # # # # # # # # #
