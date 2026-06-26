@@ -8,10 +8,6 @@
   <b>Self-hosted music streaming server</b>
 </div>
 
-<div align="center">
-  <img src="https://img.shields.io/github/v/release/swingmx/swingmusic" />
-</div>
-
 ---
 
 Swing Music is a fast and beautiful self-hosted music streaming server.  
