@@ -63,7 +63,7 @@ services:
       - SWINGMUSIC_PORT=1970
       - SWINGMUSIC_DEVICE_NAME=Home Server
     restart: unless-stopped
-
+```
 
 ## 🤝 Contributing
 
@@ -71,10 +71,11 @@ Contributions are welcome.
 
 Please open issues or pull requests for:
 
-UI improvements
-performance optimizations
-bug fixes
-new playback features
+- UI improvements
+- performance optimizations
+- bug fixes
+- new playback features
+
 ## 📄 License
 
 Swing Music is licensed under AGPLv3.
