@@ -1,2 +1,0 @@
-{"level": "WARNING", "message": "No internet connection. Downloading artist images suspended!", "timestamp": "2026-06-26T18:06:55.376538+00:00", "logger": "swingmusic.lib.populate", "module": "populate", "function": "__init__", "line": 50, "args": [], "who": "swingmusic.lib.populate"}
-{"level": "INFO", "message": "Indexing completed", "timestamp": "2026-06-26T18:06:55.411216+00:00", "logger": "swingmusic.lib.index", "module": "index", "function": "index_everything", "line": 78, "args": [], "who": "swingmusic.lib.index"}
