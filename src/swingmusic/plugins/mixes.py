@@ -1,14 +1,12 @@
 from gettext import ngettext
 from io import BytesIO
-import json
-import logging
 import random
 import time
 from urllib.parse import quote
 import requests
 from PIL import Image
 
-from swingmusic.db.userdata import MixTable
+from swingmusic.db.userdata import MixTable, SimilarArtistTable
 from swingmusic.models.artist import Artist
 from swingmusic.models.mix import Mix
 from swingmusic.models.track import Track
@@ -21,9 +19,6 @@ from swingmusic.utils.dates import get_date_range, get_duration_ago
 from swingmusic.utils.hashing import create_hash
 from swingmusic.utils.mixes import balance_mix
 from swingmusic.utils.stats import get_artists_in_period
-
-
-log = logging.getLogger(__name__)
 
 
 class MixAlreadyExists(Exception):
@@ -39,139 +34,235 @@ class MixesPlugin(Plugin):
     MIN_TRACK_MIX_LENGTH = 15
     MIN_ARTISTS_PER_MIX = 4
     MIX_TRACKS_LENGTH = 40
+    MAX_TRACKS_PER_ARTIST = 3
+    LOCAL_RELATED_LIMIT = 24
 
     MIN_DAY_LISTEN_DURATION = 3 * 60  # 3 minutes
     MIN_WEEK_LISTEN_DURATION = 10 * 60  # 10 minutes
     MIN_MONTH_LISTEN_DURATION = 20 * 60  # 20 minutes
-    RECOMMENDATION_WARNING_INTERVAL = 300
-    _last_recommendation_warning: dict[str, float] = {}
 
     def __init__(self):
         super().__init__("mixes", "Mixes")
         self.server = "https://smcloud.mungaist.com"
-        # self.server = "http://localhost:1956"
-
-        # server_online = self.ping_server()
         self.set_active(True)
-
-    def ping_server(self):
-        max_retries = 3
-        retry_delay = 2  # seconds
-
-        for attempt in range(max_retries):
-            try:
-                requests.get(self.server, timeout=10)
-                return True
-            except Exception as e:
-                print(
-                    f"Failed to connect to the recommendation server (attempt {attempt + 1}/{max_retries})"
-                )
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
-                continue
-
-        return False
-
-    @classmethod
-    def _warn_recommendation_issue(cls, message: str):
-        now = time.time()
-        last_logged = cls._last_recommendation_warning.get(message, 0)
-
-        if now - last_logged < cls.RECOMMENDATION_WARNING_INTERVAL:
-            return
-
-        cls._last_recommendation_warning[message] = now
-        log.warning(message)
 
     @plugin_method
     def get_track_mix_data(self, tracks: list[Track], with_help: bool = False):
         """
-        Given a list of tracks, creates a mix by fetching data from the
-        Swing Music Cloud recommendation server.
-
-        The server returns a list of weak trackhashes. We use these to fetch
-        the matching track data from our library database. Found tracks are
-        then balanced and returned as the final mix tracklist.
+        Given a list of tracks, creates a mix using locally available library
+        metadata and similar-artist data.
 
         :param with_help: Whether to include the help flag in the query.
-            The flag tells the server to find more data using other tracks from the same album.
+            The flag slightly relaxes the album overlap penalty.
         """
-        queries = [
-            {
-                "title": track.title,
-                "artists": [a["name"] for a in track.artists],
-                "album": track.og_album,
-                "with_help": with_help,
-            }
-            for track in tracks
-        ]
+        trackmatches, albums, artists = self.get_local_track_mix_data(
+            tracks, with_help=with_help
+        )
 
-        try:
-            response = requests.post(f"{self.server}/radio", json=queries, timeout=30)
-        except requests.exceptions.RequestException as exc:
-            self._warn_recommendation_issue(
-                f"Failed to connect to recommendation server: {exc.__class__.__name__}"
-            )
-            return [], [], []
-
-        if not response.ok:
-            self._warn_recommendation_issue(
-                f"Recommendation server returned HTTP {response.status_code}"
-            )
-            return [], [], []
-
-        try:
-            results = response.json()
-        except (json.JSONDecodeError, ValueError):
-            content_type = response.headers.get("Content-Type", "unknown")
-            self._warn_recommendation_issue(
-                "Recommendation server returned invalid JSON "
-                f"(HTTP {response.status_code}, Content-Type: {content_type})"
-            )
-            return [], [], []
-
-        if not isinstance(results, dict):
-            self._warn_recommendation_issue(
-                "Recommendation server returned an unexpected response payload"
-            )
-            return [], [], []
-
-        trackhashes: list[str] = results.get("tracks", [])
-
-        trackmatches = TrackStore.get_flat_list()
-        trackmatches = [t for t in trackmatches if t.weakhash in trackhashes]
-
-        # filter out duplicates of the same weakhash
-        # group by weakhash and pick the one with the highest bitrate
-        grouped: dict[str, list[Track]] = {}
-        for track in trackmatches:
-            grouped.setdefault(track.weakhash, []).append(track)
-
-        trackmatches = [
-            max(group, key=lambda x: x.bitrate) for group in grouped.values()
-        ]
-
-        # sort by trackhash order
-        trackmatches = sorted(trackmatches, key=lambda x: trackhashes.index(x.weakhash))
-
-        # if the mix is short, try to fill it up with tracks
-        # from album and artist data from the cloud!
-
-        # Create as many filler tracks as possible
-        # Then the mix length will be controlled in the Mix model
-        # if len(trackmatches) < self.TRACK_MIX_LENGTH:
-        if True:
+        if len(trackmatches) < self.MIN_TRACK_MIX_LENGTH:
             filler_tracks = self.fallback_create_artist_mix(
-                similar_artists=results.get("artists", []),
-                similar_albums=results.get("albums", []),
+                similar_artists=artists,
+                similar_albums=albums,
                 omit_trackhashes={t.weakhash for t in trackmatches},
-                # limit=self.TRACK_MIX_LENGTH - len(trackmatches),
             )
             trackmatches.extend(filler_tracks)
 
-        # try to balance the mix
         trackmatches = balance_mix(trackmatches)
-        return trackmatches, results.get("albums", []), results.get("artists", [])
+        return trackmatches, albums, artists
+
+    @staticmethod
+    def _get_primary_artisthash(track: Track) -> str:
+        if not track.artists:
+            return ""
+
+        return track.artists[0].get("artisthash", "")
+
+    @staticmethod
+    def _coerce_similarity_value(entry, key: str, default=None):
+        if isinstance(entry, dict):
+            return entry.get(key, default)
+
+        return getattr(entry, key, default)
+
+    @classmethod
+    def _get_similar_artist_scores(
+        cls, seed_artisthashes: set[str]
+    ) -> dict[str, float]:
+        scores: dict[str, float] = {}
+
+        for artisthash in seed_artisthashes:
+            similar = SimilarArtistTable.get_by_hash(artisthash)
+            if similar is None or not similar.similar_artists:
+                continue
+
+            for index, entry in enumerate(similar.similar_artists):
+                similar_hash = cls._coerce_similarity_value(entry, "artisthash", "")
+                if not similar_hash or similar_hash in seed_artisthashes:
+                    continue
+
+                if similar_hash not in ArtistStore.artistmap:
+                    continue
+
+                weight = cls._coerce_similarity_value(entry, "weight", None)
+
+                try:
+                    score = float(weight) if weight is not None else 0.0
+                except (TypeError, ValueError):
+                    score = 0.0
+
+                if score <= 0:
+                    score = max(1.0, 100.0 - index * 5)
+
+                scores[similar_hash] = max(scores.get(similar_hash, 0.0), score)
+
+        return scores
+
+    @classmethod
+    def _score_local_candidate(
+        cls,
+        candidate: Track,
+        seed_trackhashes: set[str],
+        seed_weakhashes: set[str],
+        seed_albumhashes: set[str],
+        seed_artisthashes: set[str],
+        seed_genrehashes: set[str],
+        similar_artist_scores: dict[str, float],
+        with_help: bool,
+    ) -> float:
+        if candidate.trackhash in seed_trackhashes or candidate.weakhash in seed_weakhashes:
+            return -1
+
+        primary_artisthash = cls._get_primary_artisthash(candidate)
+        candidate_artisthashes = set(candidate.artisthashes)
+        candidate_genrehashes = set(candidate.genrehashes)
+
+        score = 0.0
+
+        if primary_artisthash in similar_artist_scores:
+            score += 160 + min(similar_artist_scores[primary_artisthash], 100)
+
+        overlapping_artists = candidate_artisthashes.intersection(seed_artisthashes)
+        if overlapping_artists:
+            score += len(overlapping_artists) * (50 if with_help else 25)
+
+        overlapping_genres = candidate_genrehashes.intersection(seed_genrehashes)
+        if overlapping_genres:
+            score += len(overlapping_genres) * 45
+
+        if candidate.albumhash in seed_albumhashes:
+            score += 35 if with_help else 10
+
+        score += min(candidate.playcount, 25)
+        score += min(candidate.playduration / 120, 25)
+        score += min(candidate.bitrate / 64, 8)
+
+        if primary_artisthash in seed_artisthashes:
+            score -= 15
+
+        return score
+
+    @classmethod
+    def _dedupe_and_limit_tracks(cls, ranked_tracks: list[Track]) -> list[Track]:
+        results: list[Track] = []
+        seen_weakhashes: set[str] = set()
+        per_artist_count: dict[str, int] = {}
+
+        for track in ranked_tracks:
+            primary_artisthash = cls._get_primary_artisthash(track)
+
+            if track.weakhash in seen_weakhashes:
+                continue
+
+            if per_artist_count.get(primary_artisthash, 0) >= cls.MAX_TRACKS_PER_ARTIST:
+                continue
+
+            results.append(track)
+            seen_weakhashes.add(track.weakhash)
+            per_artist_count[primary_artisthash] = (
+                per_artist_count.get(primary_artisthash, 0) + 1
+            )
+
+            if len(results) >= cls.MIX_TRACKS_LENGTH * 2:
+                break
+
+        return results
+
+    @classmethod
+    def get_local_track_mix_data(
+        cls, tracks: list[Track], with_help: bool = False
+    ) -> tuple[list[Track], list[str], list[str]]:
+        seed_trackhashes = {track.trackhash for track in tracks}
+        seed_weakhashes = {track.weakhash for track in tracks}
+        seed_albumhashes = {track.albumhash for track in tracks}
+        seed_artisthashes = {
+            artisthash for track in tracks for artisthash in track.artisthashes
+        }
+        seed_genrehashes = {
+            genrehash for track in tracks for genrehash in track.genrehashes
+        }
+
+        similar_artist_scores = cls._get_similar_artist_scores(seed_artisthashes)
+
+        ranked_candidates: list[tuple[float, Track]] = []
+
+        for group in TrackStore.trackhashmap.values():
+            candidate = group.get_best()
+            score = cls._score_local_candidate(
+                candidate,
+                seed_trackhashes=seed_trackhashes,
+                seed_weakhashes=seed_weakhashes,
+                seed_albumhashes=seed_albumhashes,
+                seed_artisthashes=seed_artisthashes,
+                seed_genrehashes=seed_genrehashes,
+                similar_artist_scores=similar_artist_scores,
+                with_help=with_help,
+            )
+
+            if score <= 0:
+                continue
+
+            ranked_candidates.append((score, candidate))
+
+        ranked_candidates.sort(
+            key=lambda item: (
+                item[0],
+                item[1].playduration,
+                item[1].playcount,
+                item[1].bitrate,
+            ),
+            reverse=True,
+        )
+
+        ranked_tracks = [track for _, track in ranked_candidates]
+        ranked_tracks = cls._dedupe_and_limit_tracks(ranked_tracks)
+
+        related_artists: list[str] = []
+        for artisthash, _ in sorted(
+            similar_artist_scores.items(), key=lambda item: item[1], reverse=True
+        ):
+            related_artists.append(artisthash)
+            if len(related_artists) >= cls.LOCAL_RELATED_LIMIT:
+                break
+
+        for track in ranked_tracks:
+            artisthash = cls._get_primary_artisthash(track)
+            if not artisthash or artisthash in seed_artisthashes or artisthash in related_artists:
+                continue
+
+            related_artists.append(artisthash)
+            if len(related_artists) >= cls.LOCAL_RELATED_LIMIT:
+                break
+
+        related_albums: list[str] = []
+        for track in ranked_tracks:
+            if track.albumhash in seed_albumhashes or track.albumhash in related_albums:
+                continue
+
+            related_albums.append(track.albumhash)
+            if len(related_albums) >= cls.LOCAL_RELATED_LIMIT:
+                break
+
+        return ranked_tracks, related_albums, related_artists
 
     # @plugin_method
     # def get_artist_mix(self, artisthash: str):
@@ -409,8 +500,7 @@ class MixesPlugin(Plugin):
         Creates an artist mix by selecting random tracks from similar albums and artists.
 
         This is used when:
-        - The Swing Music recommendation server is down.
-        - The artist has less than self.MIN_TRACK_MIX_LENGTH tracks from the cloud mix.
+        - The local recommendation pass yields too few tracks.
         - When we need to dilute the mix to balance the artist distribution.
 
         :param similar_albums: A list of similar album weakhashes to select tracks from.
@@ -423,7 +513,7 @@ class MixesPlugin(Plugin):
         albummatches = (
             a
             for a in AlbumStore.albummap.values()
-            if a.album.weakhash in similar_albums
+            if a.album.albumhash in similar_albums or a.album.weakhash in similar_albums
         )
 
         for match in albummatches:
