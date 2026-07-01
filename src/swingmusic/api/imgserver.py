@@ -131,6 +131,35 @@ def send_file_or_fallback(
     return send_fallback_img(fallback)
 
 
+def send_mix_file_or_artist_fallback(folder: Path, filename: str):
+    """
+    Return a mix image, or fall back to an artist image with the same name.
+
+    Artist mixes may store the canonical artist image filename in their payload
+    even when no dedicated file exists yet under images/mixes.
+    """
+    mix_path = folder / filename
+
+    if mix_path.exists():
+        return send_from_directory(folder, filename)
+
+    artist_folder = None
+
+    if folder == Paths().md_mixes_img_path:
+        artist_folder = Paths().md_artist_img_path
+    elif folder == Paths().sm_mixes_img_path:
+        artist_folder = Paths().sm_artist_img_path
+
+    if artist_folder is not None and (artist_folder / filename).exists():
+        return send_from_directory(artist_folder, filename)
+
+    lg_artist_folder = Paths().lg_artist_img_path
+    if (lg_artist_folder / filename).exists():
+        return send_from_directory(lg_artist_folder, filename)
+
+    return send_fallback_img("artist.webp")
+
+
 class ImagePath(BaseModel):
     imgpath: str = Field(
         description="The image filename",
@@ -245,7 +274,7 @@ def send_md_mix_image(path: ImagePath):
     Get medium mix image
     """
     folder = Paths().md_mixes_img_path
-    return send_file_or_fallback(folder, path.imgpath, "playlist.svg")
+    return send_mix_file_or_artist_fallback(folder, path.imgpath)
 
 
 @api.get("/mix/small/<imgpath>")
@@ -254,4 +283,4 @@ def send_sm_mix_image(path: ImagePath):
     Get small mix image
     """
     folder = Paths().sm_mixes_img_path
-    return send_file_or_fallback(folder, path.imgpath, "playlist.svg")
+    return send_mix_file_or_artist_fallback(folder, path.imgpath)

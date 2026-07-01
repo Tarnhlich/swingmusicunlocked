@@ -36,6 +36,8 @@ class MixesPlugin(Plugin):
     MIX_TRACKS_LENGTH = 40
     MAX_TRACKS_PER_ARTIST = 3
     LOCAL_RELATED_LIMIT = 24
+    MAX_SEED_ARTIST_TRACKS = 1
+    _current_seed_primary_artists: set[str] = set()
 
     MIN_DAY_LISTEN_DURATION = 3 * 60  # 3 minutes
     MIN_WEEK_LISTEN_DURATION = 10 * 60  # 10 minutes
@@ -84,6 +86,76 @@ class MixesPlugin(Plugin):
 
         return getattr(entry, key, default)
 
+    @staticmethod
+    def _get_track_decade(track: Track) -> int | None:
+        year = getattr(track, "date", 0) or 0
+
+        if year < 1000:
+            return None
+
+        return int(year) // 10 * 10
+
+    @classmethod
+    def _get_seed_profile(cls, tracks: list[Track]) -> dict[str, set[str] | set[int]]:
+        primary_artists = set()
+        all_artists = set()
+        album_artists = set()
+        genres = set()
+        decades = set()
+
+        for track in tracks:
+            primary_artisthash = cls._get_primary_artisthash(track)
+            if primary_artisthash:
+                primary_artists.add(primary_artisthash)
+
+            all_artists.update(track.artisthashes)
+            album_artists.update(a["artisthash"] for a in track.albumartists)
+            genres.update(track.genrehashes)
+
+            decade = cls._get_track_decade(track)
+            if decade is not None:
+                decades.add(decade)
+
+        return {
+            "primary_artists": primary_artists,
+            "all_artists": all_artists,
+            "album_artists": album_artists,
+            "genres": genres,
+            "decades": decades,
+        }
+
+    @staticmethod
+    def _score_decade_match(candidate_decade: int | None, seed_decades: set[int]) -> float:
+        if candidate_decade is None or not seed_decades:
+            return 0.0
+
+        distances = [abs(candidate_decade - decade) for decade in seed_decades]
+        nearest = min(distances)
+
+        if nearest == 0:
+            return 40.0
+
+        if nearest == 10:
+            return 20.0
+
+        if nearest == 20:
+            return 8.0
+
+        return 0.0
+
+    @staticmethod
+    def _score_novelty(candidate: Track) -> float:
+        playcount = getattr(candidate, "playcount", 0) or 0
+        playduration = getattr(candidate, "playduration", 0) or 0
+
+        novelty_bonus = max(0.0, 18.0 - min(playcount, 18))
+        novelty_bonus += max(0.0, 14.0 - min(playduration / 180, 14))
+
+        popularity_penalty = min(playcount / 2.5, 18.0)
+        popularity_penalty += min(playduration / 900, 16.0)
+
+        return novelty_bonus - popularity_penalty
+
     @classmethod
     def _get_similar_artist_scores(
         cls, seed_artisthashes: set[str]
@@ -124,40 +196,73 @@ class MixesPlugin(Plugin):
         seed_trackhashes: set[str],
         seed_weakhashes: set[str],
         seed_albumhashes: set[str],
-        seed_artisthashes: set[str],
-        seed_genrehashes: set[str],
+        seed_profile: dict[str, set[str] | set[int]],
         similar_artist_scores: dict[str, float],
         with_help: bool,
     ) -> float:
-        if candidate.trackhash in seed_trackhashes or candidate.weakhash in seed_weakhashes:
+        if (
+            candidate.trackhash in seed_trackhashes
+            or candidate.weakhash in seed_weakhashes
+        ):
             return -1
 
         primary_artisthash = cls._get_primary_artisthash(candidate)
         candidate_artisthashes = set(candidate.artisthashes)
         candidate_genrehashes = set(candidate.genrehashes)
+        candidate_album_artists = {a["artisthash"] for a in candidate.albumartists}
+        candidate_decade = cls._get_track_decade(candidate)
+
+        seed_primary_artists: set[str] = seed_profile["primary_artists"]  # type: ignore[assignment]
+        seed_all_artists: set[str] = seed_profile["all_artists"]  # type: ignore[assignment]
+        seed_album_artists: set[str] = seed_profile["album_artists"]  # type: ignore[assignment]
+        seed_genres: set[str] = seed_profile["genres"]  # type: ignore[assignment]
+        seed_decades: set[int] = seed_profile["decades"]  # type: ignore[assignment]
 
         score = 0.0
+        theme_signals = 0
 
         if primary_artisthash in similar_artist_scores:
-            score += 160 + min(similar_artist_scores[primary_artisthash], 100)
+            score += 80 + min(similar_artist_scores[primary_artisthash], 70)
+            theme_signals += 1
 
-        overlapping_artists = candidate_artisthashes.intersection(seed_artisthashes)
+        overlapping_artists = candidate_artisthashes.intersection(seed_all_artists)
         if overlapping_artists:
-            score += len(overlapping_artists) * (50 if with_help else 25)
+            if primary_artisthash in seed_primary_artists:
+                score += 10 if with_help else -15
+            else:
+                score += len(overlapping_artists) * 18
+                theme_signals += 1
 
-        overlapping_genres = candidate_genrehashes.intersection(seed_genrehashes)
+        overlapping_album_artists = candidate_album_artists.intersection(seed_album_artists)
+        if overlapping_album_artists:
+            score += len(overlapping_album_artists) * 14
+            theme_signals += 1
+
+        overlapping_genres = candidate_genrehashes.intersection(seed_genres)
         if overlapping_genres:
-            score += len(overlapping_genres) * 45
+            score += min(len(overlapping_genres), 3) * 55
+            theme_signals += 1
 
         if candidate.albumhash in seed_albumhashes:
-            score += 35 if with_help else 10
+            score += 20 if with_help else 5
+            theme_signals += 1
 
-        score += min(candidate.playcount, 25)
-        score += min(candidate.playduration / 120, 25)
-        score += min(candidate.bitrate / 64, 8)
+        decade_score = cls._score_decade_match(candidate_decade, seed_decades)
+        score += decade_score
+        if decade_score > 0:
+            theme_signals += 1
 
-        if primary_artisthash in seed_artisthashes:
-            score -= 15
+        score += cls._score_novelty(candidate)
+        score += min(candidate.bitrate / 96, 4)
+
+        if primary_artisthash in seed_primary_artists and not with_help:
+            score -= 20
+
+        if theme_signals == 0:
+            return -1
+
+        if theme_signals == 1:
+            score -= 20
 
         return score
 
@@ -173,7 +278,11 @@ class MixesPlugin(Plugin):
             if track.weakhash in seen_weakhashes:
                 continue
 
-            if per_artist_count.get(primary_artisthash, 0) >= cls.MAX_TRACKS_PER_ARTIST:
+            max_tracks = cls.MAX_TRACKS_PER_ARTIST
+            if primary_artisthash in cls._current_seed_primary_artists:
+                max_tracks = cls.MAX_SEED_ARTIST_TRACKS
+
+            if per_artist_count.get(primary_artisthash, 0) >= max_tracks:
                 continue
 
             results.append(track)
@@ -194,14 +303,11 @@ class MixesPlugin(Plugin):
         seed_trackhashes = {track.trackhash for track in tracks}
         seed_weakhashes = {track.weakhash for track in tracks}
         seed_albumhashes = {track.albumhash for track in tracks}
-        seed_artisthashes = {
-            artisthash for track in tracks for artisthash in track.artisthashes
-        }
-        seed_genrehashes = {
-            genrehash for track in tracks for genrehash in track.genrehashes
-        }
+        seed_profile = cls._get_seed_profile(tracks)
+        seed_artisthashes: set[str] = seed_profile["all_artists"]  # type: ignore[assignment]
 
         similar_artist_scores = cls._get_similar_artist_scores(seed_artisthashes)
+        cls._current_seed_primary_artists = set(seed_profile["primary_artists"])  # type: ignore[arg-type]
 
         ranked_candidates: list[tuple[float, Track]] = []
 
@@ -212,8 +318,7 @@ class MixesPlugin(Plugin):
                 seed_trackhashes=seed_trackhashes,
                 seed_weakhashes=seed_weakhashes,
                 seed_albumhashes=seed_albumhashes,
-                seed_artisthashes=seed_artisthashes,
-                seed_genrehashes=seed_genrehashes,
+                seed_profile=seed_profile,
                 similar_artist_scores=similar_artist_scores,
                 with_help=with_help,
             )
@@ -225,12 +330,11 @@ class MixesPlugin(Plugin):
 
         ranked_candidates.sort(
             key=lambda item: (
-                item[0],
-                item[1].playduration,
+                -item[0],
                 item[1].playcount,
-                item[1].bitrate,
-            ),
-            reverse=True,
+                item[1].playduration,
+                -item[1].bitrate,
+            )
         )
 
         ranked_tracks = [track for _, track in ranked_candidates]
