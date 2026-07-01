@@ -15,8 +15,9 @@ def get_album_color(path: AlbumHashSchema):
     album = Store.get_album_by_hash(path.albumhash)
 
     msg = {"color": ""}
+    color = getattr(album, "color", "") if album is not None else ""
 
-    if album is None or len(album.colors) == 0:
+    if not color:
         return msg, 404
 
-    return {"color": album.colors[0]}
+    return {"color": color}

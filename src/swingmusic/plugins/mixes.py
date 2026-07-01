@@ -1,6 +1,7 @@
 from gettext import ngettext
 from io import BytesIO
 import json
+import logging
 import random
 import time
 from urllib.parse import quote
@@ -22,6 +23,9 @@ from swingmusic.utils.mixes import balance_mix
 from swingmusic.utils.stats import get_artists_in_period
 
 
+log = logging.getLogger(__name__)
+
+
 class MixAlreadyExists(Exception):
     """
     Raised when a mix with the same sourcehash already exists.
@@ -39,6 +43,8 @@ class MixesPlugin(Plugin):
     MIN_DAY_LISTEN_DURATION = 3 * 60  # 3 minutes
     MIN_WEEK_LISTEN_DURATION = 10 * 60  # 10 minutes
     MIN_MONTH_LISTEN_DURATION = 20 * 60  # 20 minutes
+    RECOMMENDATION_WARNING_INTERVAL = 300
+    _last_recommendation_warning: dict[str, float] = {}
 
     def __init__(self):
         super().__init__("mixes", "Mixes")
@@ -66,6 +72,17 @@ class MixesPlugin(Plugin):
 
         return False
 
+    @classmethod
+    def _warn_recommendation_issue(cls, message: str):
+        now = time.time()
+        last_logged = cls._last_recommendation_warning.get(message, 0)
+
+        if now - last_logged < cls.RECOMMENDATION_WARNING_INTERVAL:
+            return
+
+        cls._last_recommendation_warning[message] = now
+        log.warning(message)
+
     @plugin_method
     def get_track_mix_data(self, tracks: list[Track], with_help: bool = False):
         """
@@ -91,14 +108,32 @@ class MixesPlugin(Plugin):
 
         try:
             response = requests.post(f"{self.server}/radio", json=queries, timeout=30)
-        except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout):
-            print("Failed to connect to recommendation server")
+        except requests.exceptions.RequestException as exc:
+            self._warn_recommendation_issue(
+                f"Failed to connect to recommendation server: {exc.__class__.__name__}"
+            )
+            return [], [], []
+
+        if not response.ok:
+            self._warn_recommendation_issue(
+                f"Recommendation server returned HTTP {response.status_code}"
+            )
             return [], [], []
 
         try:
             results = response.json()
-        except json.JSONDecodeError:
-            print("Failed to decode JSON response from recommendation server")
+        except (json.JSONDecodeError, ValueError):
+            content_type = response.headers.get("Content-Type", "unknown")
+            self._warn_recommendation_issue(
+                "Recommendation server returned invalid JSON "
+                f"(HTTP {response.status_code}, Content-Type: {content_type})"
+            )
+            return [], [], []
+
+        if not isinstance(results, dict):
+            self._warn_recommendation_issue(
+                "Recommendation server returned an unexpected response payload"
+            )
             return [], [], []
 
         trackhashes: list[str] = results.get("tracks", [])
